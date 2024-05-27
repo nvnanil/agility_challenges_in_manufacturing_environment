@@ -4,6 +4,7 @@ from time import sleep
 from math import cos, sin, pi
 from copy import copy
 import time
+import threading
 import PyKDL
 from sympy import Quaternion
 from ament_index_python import get_package_share_directory
@@ -11,16 +12,19 @@ from moveit import MoveItPy, PlanningSceneMonitor
 import rclpy
 import pyassimp
 import yaml
-from rclpy.time import Duration
+import rclpy.logging
 from rclpy.node import Node
+from rclpy.time import Time
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.parameter import Parameter
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 
 from geometry_msgs.msg import PoseStamped, Pose, Point, TransformStamped
+import rclpy.time
 from shape_msgs.msg import Mesh, MeshTriangle
 from moveit_msgs.msg import CollisionObject, AttachedCollisionObject, PlanningScene
 from std_msgs.msg import Header
+from builtin_interfaces.msg import Duration
 
 from sensor_msgs.msg import Image as ImageMsg
 from cv_bridge import CvBridge, CvBridgeError
@@ -41,8 +45,10 @@ from ariac_msgs.msg import (
     CompetitionState as CompetitionStateMsg,
     BreakBeamStatus as BreakBeamStatusMsg,
     AdvancedLogicalCameraImage as AdvancedLogicalCameraImageMsg,
+    ConveyorParts as ConveyorPartsMsg,
     Part as PartMsg,
     PartPose as PartPoseMsg,
+    PartLot as PartLotMsg,
     Order as OrderMsg,
     AssemblyPart as AssemblyPartMsg,
     AGVStatus as AGVStatusMsg,
@@ -187,6 +193,7 @@ class CompetitionInterface(Node):
         # ROS2 callback groups
         self.ariac_cb_group = MutuallyExclusiveCallbackGroup()
         self.moveit_cb_group = MutuallyExclusiveCallbackGroup()
+        self.breakbeam_cb_group = MutuallyExclusiveCallbackGroup()
         self.orders_cb_group = ReentrantCallbackGroup()
 
         # Service clients for starting and ending the competition
@@ -201,6 +208,15 @@ class CompetitionInterface(Node):
             10,
             callback_group=self.ariac_cb_group)
         
+        # Sbbscriber to the parts coming on the conveyor
+        self._conveyor_parts_sub = self.create_subscription(
+            ConveyorPartsMsg(),
+            'ariac/conveyor_parts',
+            self._conveyor_parts_cb,
+            qos_profile_sensor_data,
+            callback_group=self.ariac_cb_group
+        )
+        
         # Store the state of the competition
         self._competition_state: CompetitionStateMsg = None
         
@@ -212,9 +228,52 @@ class CompetitionInterface(Node):
 
         # Store each camera image as an AdvancedLogicalCameraImage object
         self._camera_image: AdvancedLogicalCameraImage = None
+        
+        # To check if the conveyor camera has recieved any data
+        self._conveyor_camera_recieved_data = False
+        
+        # To check if the conveyor has any parts
+        self._conveyor_parts_recieved_data = False
 
         # Turn on debug image publishing for part detection
         self.display_bounding_boxes =  False
+        
+        # To store the world pose of the breakbeam
+        self._breakbeam_pose = Pose()
+        
+        # To store the latest agv tray pose near the floor robot
+        self._agv_tray_pose = Pose()
+        
+        # Conveyor speed
+        self._conveyor_speed = 0.2
+        
+        # To detect the object in the second breakbeam
+        self._object_detected_breakbeam2 = False
+        
+        # To detect the object in the third breakbeam
+        self._object_detected_breakbeam3 = False
+        
+        # To check if the required part is detected by the conveyor camera
+        self._found_part = False
+        
+        # To count the index of objects for different brekbeams
+        self._object_beam1 = 0
+        self._object_beam2 = 0
+        self._object_beam3 = 0
+        
+        # To store the conveyor index of the detcted part
+        self._index = 0
+        
+        # Order recieved fro conveyor pickup
+        self._order_conveyor = PartMsg()
+        
+        # To deteremine whether we need to apeend to the list
+        self._append_items = False
+        
+        self._floor_robot_conveyor = False
+        
+        # To check if the required parts are not present in the bins. If not then move to conveyor
+        self._found = True
 
         # cv_bridge interface
         self._bridge = CvBridge()
@@ -308,8 +367,17 @@ class CompetitionInterface(Node):
         # List of orders
         self._orders = []
         
-        # Variable to check for pririty orders
+        # List of expected conveyor parts
+        self._conveyor_parts_expected = []
+        
+        # List of actual conveyor parts
+        self._conveyor_parts = []
+        
+        # Variable to check for priority orders
         self._flag = False
+        
+        # To lock the thread to prevent access by multiple resources
+        self._lock = threading.Lock()
         
         # Subscriber to the floor gripper state topic
         self._floor_robot_gripper_state_sub = self.create_subscription(
@@ -327,13 +395,31 @@ class CompetitionInterface(Node):
             qos_profile_sensor_data,
             callback_group=self.ariac_cb_group)
         
-        # Subscriber to the breakbeam status topic
+        # Subscriber to the breakbeam change topic
         self._breakbeam_sub = self.create_subscription(
             BreakBeamStatusMsg,
-            '/ariac/sensors/conveyor_breakbeam/status',
+            '/ariac/sensors/conveyor_breakbeam/change',
             self._breakbeam_cb,
             qos_profile_sensor_data,
-            callback_group = self.ariac_cb_group
+            callback_group = self.breakbeam_cb_group
+        )
+        
+        # Subscriber to the breakbeam2 change topic
+        self._breakbeam2_sub = self.create_subscription(
+            BreakBeamStatusMsg,
+            '/ariac/sensors/conveyor_breakbeam2/change',
+            self._breakbeam2_cb,
+            qos_profile_sensor_data,
+            callback_group = self.breakbeam_cb_group
+        )
+        
+        # Subscriber to the brekbeam3 chnage topic  (below the floor robot conveyor location)
+        self._breakbeam3_sub = self.create_subscription(
+            BreakBeamStatusMsg,
+            '/ariac/sensors/conveyor_breakbeam3/change',
+            self._breakbeam3_cb,
+            qos_profile_sensor_data,
+            callback_group = self.breakbeam_cb_group
         )
 
         # Service client for turning on/off the vacuum gripper on the floor robot
@@ -368,17 +454,20 @@ class CompetitionInterface(Node):
 
             self._world_collision_objects = []
 
-            # Parts found in the bins
+            # Parts found in the bins and the conveyor
             self._left_bins_parts = []
             self._right_bins_parts = []
+            self._conveyor_part_detected = PartPoseMsg()
             self._left_bins_camera_pose = Pose()
             self._right_bins_camera_pose = Pose()
+            
 
             # Tray information
             self._kts1_trays = []
             self._kts2_trays = []
             self._kts1_camera_pose = Pose()
             self._kts2_camera_pose = Pose()
+            self._conveyor_camera_pose = Pose()
 
             # service clients
             self.get_cartesian_path_client = self.create_client(GetCartesianPath, "compute_cartesian_path")
@@ -405,6 +494,11 @@ class CompetitionInterface(Node):
                                                          self._kts2_camera_cb,
                                                          qos_profile_sensor_data,
                                                          callback_group=self.moveit_cb_group)
+        self.conveyor_camera_sub = self.create_subscription(AdvancedLogicalCameraImageMsg,
+                                                            'ariac/sensors/conveyor_camera/image',
+                                                            self._conveyor_camera_cb,
+                                                            qos_profile_sensor_data,
+                                                            callback_group=self.moveit_cb_group)
         # RGB camera subs
         self.right_bins_RGB_camera_sub = self.create_subscription(ImageMsg,
                                                                   "/ariac/sensors/right_bins_RGB_camera/rgb_image",
@@ -466,7 +560,7 @@ class CompetitionInterface(Node):
         # Meshes file path
         self.mesh_file_path = get_package_share_directory("ariac_tutorials") + "/meshes/"
 
-        
+        # JOint positions for the floor robot
         self.floor_joint_positions_arrs = {
             "floor_kts1_js_":[4.0,1.57,-1.57,1.57,-1.57,-1.57,0.0],
             "floor_kts2_js_":[-4.0,-1.57,-1.57,1.57,-1.57,-1.57,0.0],
@@ -480,10 +574,7 @@ class CompetitionInterface(Node):
         self.floor_position_dict = {key:self._create_floor_joint_position_state(self.floor_joint_positions_arrs[key])
                                       for key in self.floor_joint_positions_arrs.keys()}
 
-    @property
-    def orders(self):
-        return self._orders
-
+  
     @property
     def camera_image(self):
         return self._camera_image
@@ -504,6 +595,10 @@ class CompetitionInterface(Node):
     def get_competition_state(self):
         return self._competition_state
     
+    @property
+    def found(self):
+        return self._found
+    
     @flag.setter
     def flag(self, value):
         self._flag = value
@@ -511,6 +606,10 @@ class CompetitionInterface(Node):
     @parse_incoming_order.setter
     def parse_incoming_order(self, value):
         self._parse_incoming_order = value
+        
+    @found.setter
+    def found(self, value):
+        self._found = value
 
     def _orders_cb(self, msg: OrderMsg):
         '''Callback for the topic /ariac/orders
@@ -535,17 +634,77 @@ class CompetitionInterface(Node):
                                                         msg.tray_poses,
                                                         msg.sensor_pose)
 
+    def _conveyor_parts_cb (self, msg: ConveyorPartsMsg):
+        """Callback for the topic /ariac/conveyor_parts
+
+        Args:
+            msg (ConveyorPartsMsg): List of parts expected on the conveyor
+        """
+        if not self._conveyor_parts_recieved_data:
+            self.get_logger().info("Recieved data from conveyor parts")
+            self._conveyor_parts_recieved_data = True
+        
+        self._conveyor_parts_expected = msg.parts
+    
     def _breakbeam_cb(self, msg: BreakBeamStatusMsg):
-        '''Callback for the topic /ariac/sensors/conveyor_breakbeam/status
+        '''Callback for the topic /ariac/sensors/conveyor_breakbeam/change
 
         Arguments:
             msg -- BreakBeamStatusMsg message
         '''
-        if not self._object_detected and msg.object_detected:
-            self._conveyor_part_count += 1
+        if not self._object_detected:
+            # self._conveyor_part_count += 1
+            self._object_detected = True
+            self._breakbeam_pose = self._frame_world_pose(msg.header.frame_id)
+        
+        break_beam_status = msg.object_detected    
+        part_to_add = PartPoseMsg()
+        # detection_time = self.get_clock().now()
+        prev_distance = 0
+        count = 0
+        
+        if break_beam_status:
+            self._object_beam1 = self._object_beam1 + 1
+            if self._append_items:
+                with self._lock:
+                    if self._found_part:
+                        self.get_logger().info("Breakbeam1 detected the required part")
+                        self.get_logger().info(f"Index number is {self._object_beam1}")
+                        self._index = self._object_beam1
+                        # self._conveyor_parts = part
+                        self._append_items = False
+                        self._found_part = False
+                
+    def _breakbeam2_cb (self, msg: BreakBeamStatusMsg):
+        """Callback for the topic /ariac/sensors/conveyor_breakbeam2/change
 
-        self._object_detected = msg.object_detected
+        Args:
+            msg -- BreakBeamStatusMsg message
+        """
+        breakbeam2_status = msg.object_detected
+        if breakbeam2_status:
+            self._object_beam2 = self._object_beam2 + 1
+            if self._object_beam2 == self._index:
+                self._object_detected_breakbeam2 = True
+                self.get_logger().info(f"Detected index number {self._object_beam2} confirmed at breakbeam2")
+                self._detection_time = self.get_clock().now().nanoseconds
+                # self.get_logger().info("Performing pickup")
+                # self._object_detected_breakbeam2_time = msg.header.stamp.nanosec
+                
+    def _breakbeam3_cb (self, msg: BreakBeamStatusMsg):
+        """Callback for the topic /ariac/sensors/conveyor_breakbeam3/change
 
+        Args:
+            msg -- BreakBeamStatusMsg message
+        """
+        breakbeam3_status = msg.object_detected
+        if breakbeam3_status:
+            self._object_beam3 = self._object_beam3 + 1
+            if self._object_beam3 == self._index:
+                self._object_detected_breakbeam3 = True
+                self.get_logger().info("Required part nearby")
+            
+                    
     def _competition_state_cb(self, msg: CompetitionStateMsg):
         '''Callback for the topic /ariac/competition_state
         Arguments:
@@ -606,6 +765,8 @@ class CompetitionInterface(Node):
             self.get_logger().warn('Unable to start competition')
     
     def end_competition(self):
+        """Function to call the service client to end the competition
+        """
         self.get_logger().info('Ending competition')
 
         # Check if service is available
@@ -879,6 +1040,11 @@ class CompetitionInterface(Node):
             self.get_logger().warn('Unable to change gripper state')
 
     def set_ceiling_robot_gripper_state(self, enable):
+        """Set the gripper state of the ceiling robot
+
+        Args:
+            enable (_type_): True to enable, False to disable
+        """
         if self._ceiling_robot_gripper_state.enabled == enable:
             if self._ceiling_robot_gripper_state:
                 self.get_logger().info("Already enabled")
@@ -904,6 +1070,18 @@ class CompetitionInterface(Node):
                                   max_acceleration_scaling_factor : float,
                                   avoid_collision : bool,
                                   robot : str):
+        """Generates the cartesian path trajectroy
+
+        Args:
+            waypoints (list): The waypoints in the path
+            max_velocity_scaling_factor (float): Velocity to be followed in the trajectory
+            max_acceleration_scaling_factor (float): Acceleration to be followed in the trajectroy
+            avoid_collision (bool): True to check for collision
+            robot (str): Type of robot to be used
+
+        Returns:
+            THe cartesian trajcectory
+        """
 
         self.get_logger().info("Getting cartesian path")
 
@@ -942,6 +1120,48 @@ class CompetitionInterface(Node):
             self.get_logger().error("Unable to plan cartesian trajectory")
 
         return result.solution
+    
+    def _call_get_cartesian_path_conveyor(self, waypoints : list, 
+                                  max_velocity_scaling_factor : float, 
+                                  max_acceleration_scaling_factor : float,
+                                  avoid_collision : bool,
+                                  robot : str = "floor_robot"):
+
+        self.get_logger().info("Getting cartesian path")
+
+        request = GetCartesianPath.Request()
+
+        header = Header()
+        header.frame_id = "world"
+        header.stamp = self.get_clock().now().to_msg()
+
+        request.header = header
+        with self._planning_scene_monitor.read_write() as scene:
+            request.start_state = robotStateToRobotStateMsg(scene.current_state)
+
+        if robot == "floor_robot":
+            request.group_name = "floor_robot"
+            request.link_name = "floor_gripper"
+        
+        request.waypoints = waypoints
+        request.max_step = 0.1
+        request.avoid_collisions = avoid_collision
+        request.max_velocity_scaling_factor = max_velocity_scaling_factor
+        request.max_acceleration_scaling_factor = max_acceleration_scaling_factor
+
+        future = self.get_cartesian_path_client.call_async(request)
+
+        while not future.done():
+            pass
+
+        result: GetCartesianPath.Response
+        result = future.result()
+
+        if result.fraction < 0.9:
+            self.get_logger().error("Unable to plan cartesian trajectory")
+            return False, result.solution
+        else:
+            return True, result.solution
     
     def _plan_and_execute(
         self,
@@ -1118,7 +1338,19 @@ class CompetitionInterface(Node):
         self._kts2_trays = msg.tray_poses
         self._kts2_camera_pose = msg.sensor_pose
     
-
+    def _conveyor_camera_cb(self, msg: AdvancedLogicalCameraImage):
+        if not self._conveyor_camera_recieved_data:
+            self.get_logger().info("Recieved data from the conveyor camera")
+            self._conveyor_camera_recieved_data = True
+        
+        # for part in msg.part_poses:
+        if self._append_items:
+            for part in msg.part_poses:
+                if part.part.color == self._order_conveyor.color and part.part.type == self._order_conveyor.type:
+                    self._found_part = True
+                    self._conveyor_part_detected = part
+        self._conveyor_camera_pose = msg.sensor_pose
+        
     def _left_bins_RGB_camera_cb(self, msg: ImageMsg):
         try:
             self._left_bins_camera_image = self._bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -1315,12 +1547,18 @@ class CompetitionInterface(Node):
                 self.get_logger().error("Unable to pick up part")
 
     def floor_robot_pick_bin_part(self,part_to_pick : PartMsg):
+        """Picks up the required parts from the bins if present
+
+        Args:
+            part_to_pick (PartMsg): Contains information regarding the color and type of part
+        """
         if not self.moveit_enabled:
             self.get_logger().error("Moveit_py is not enabled, unable to pick bin part")
             return
         part_pose = Pose()
         found_part = False
         bin_side = ""
+        # Look for the bin containing the required parts
         for part in self._left_bins_parts:
             part : PartPoseMsg
             if (part.part.type == part_to_pick.type and part.part.color == part_to_pick.color):
@@ -1340,6 +1578,8 @@ class CompetitionInterface(Node):
         
         if not found_part:
             self.get_logger().error("Unable to locate part")
+            self._found = False
+            return
         else:
             self.get_logger().info(f"Part found in {bin_side}")
 
@@ -1370,60 +1610,210 @@ class CompetitionInterface(Node):
         self._attach_model_to_floor_gripper(part_to_pick, part_pose)
 
         self.floor_robot_attached_part_ = part_to_pick
-    
+        
+    def floor_robot_pick_conveyor_part(self, part_to_pick: PartMsg):
+        """Function to pickup part from conveyor
+
+        Args:
+            part_to_pick (PartMsg): Contains the information of the part to be picked up
+
+        Returns:
+            Returns True if part picked up
+        """
+        if not self._conveyor_parts_expected:
+            self.get_logger().info("No parts expected on the conveyor")
+            return False
+        for parts in self._conveyor_parts_expected:
+            if parts.part.type == part_to_pick.type and parts.part.color == part_to_pick.color:
+                self.get_logger().info(f"Attempting to pickup a {CompetitionInterface._part_colors[parts.part.color]} part of type {CompetitionInterface._part_types[parts.part.type]} from the conveyor")
+                break
+            else:
+                self.get_logger().info("Unable to locate part on the conveyor")
+                
+        self._order_conveyor = part_to_pick
+        floor_robot_conveyor = False
+        found_part = False
+        part_picked = False
+        num_tries = 0
+        part_pose = Pose()
+        part_on_conveyor = PartPoseMsg()
+        
+        # Change gripper to parts gripper at the closest at the kitting station
+        if self._floor_robot_gripper_state.type != "part_gripper":
+            if self._agv_tray_pose.position.y<0:
+                station = "kts1"
+            else: 
+                station = "kts2"
+            self.floor_robot_move_to_joint_position(f"floor_{station}_js_")
+            self._floor_robot_change_gripper(station, "parts")
+        self.get_logger().info("Moving floor robot to conveyor pickup location")
+        self.floor_robot_move_to_joint_position("floor_conveyor_js_")
+        self.get_logger().info("Reached part pickup location")
+        # sleep(1)
+        # Start checking for parts only when the floor robot is at the conveyor location
+        if not floor_robot_conveyor:
+            self._append_items = True
+            floor_robot_conveyor = True
+        while not part_picked:
+            if self._object_detected_breakbeam2:
+                # found_part = False
+                # self.floor_robot_move_to_joint_position("floor_conveyor_js_")
+                self._object_detected_breakbeam2 = False
+                part_on_conveyor = self._conveyor_part_detected 
+                # Get the required part orientation and the orientation of the gripper to pick up
+                part_pose = multiply_pose(self._conveyor_camera_pose, part_on_conveyor.pose)
+                part_rotation = rpy_from_quaternion(part_pose.orientation)[2]
+                gripper_orientation = quaternion_from_euler(0.0,pi,part_rotation)
+                with self._planning_scene_monitor.read_write() as scene:
+                    robot_pose = Pose()
+                    robot_pose = scene.current_state.get_pose("floor_gripper")
+                self._move_floor_robot_to_pose(build_pose(part_pose.position.x, robot_pose.position.y,
+                                                part_pose.position.z+0.15, gripper_orientation))
+                self.get_logger().info(f"Before pickup{part_pose.position.z+0.15}")
+                self.get_logger().info("Preparing for pickup")
+                # current_time = self.get_clock().now().nanoseconds * 1e-9
+                # while self._conveyor_speed * (self.get_clock().now().nanoseconds - self._object_detected_breakbeam2_time) * 1e-9 > 0.8:
+                #     self.get_logger().info("Waiting for part to arrive at pickup location")
+                #     break
+                self.get_logger().info(f"Picking up a {CompetitionInterface._part_colors[part_to_pick.color]} {CompetitionInterface._part_types[part_to_pick.type]}")
+                waypoints = [build_pose(part_pose.position.x, robot_pose.position.y,
+                part_pose.position.z+CompetitionInterface._part_heights[part_to_pick.type],
+                gripper_orientation)]
+                self.get_logger().info(f"After pickup{part_pose.position.z+CompetitionInterface._part_heights[part_to_pick.type]}")
+                # validity, trajectory = self._call_get_cartesian_path_conveyor(waypoints, 0.5, 0.5, True)     
+                # if not validity:
+                #     part_picked = False
+                #     self._append_items = True
+                #     num_tries +=1
+                #     continue
+                # while (((self.get_clock().now().nanoseconds - self._detection_time) * 1e-9)/self._conveyor_speed) > 3.9:
+                #     self.get_logger().warn("Picking up")
+                #     break
+                # To check if the object is close to the floor robot location
+                while not self._object_detected_breakbeam3:
+                    pass
+                
+                self.get_logger().info("Exited while loop")
+                self._object_detected_breakbeam3 = False
+                # start_time = self.get_clock().now()
+                # while not self._floor_robot_gripper_state.attached:
+                #     if (self.get_clock().now() - start_time).nanoseconds > 1.5e9:
+                #         break
+                self._move_floor_robot_cartesian(waypoints, 0.4, 0.4, False)
+                self.set_floor_robot_gripper_state(True)
+                sleep(0.5)
+                # self._floor_robot_wait_for_attach(15.0, gripper_orientation)
+          
+                # If the part is picked then add to the planning scene
+                if self._floor_robot_gripper_state.attached:
+                    self._attach_model_to_floor_gripper(part_to_pick, part_pose)
+                    self.floor_robot_attached_part_ = part_to_pick
+                    part_picked = True
+                self._move_floor_robot_to_pose(build_pose(robot_pose.position.x, robot_pose.position.y,
+                                                    robot_pose.position.z+0.2, gripper_orientation))
+                if not part_picked:
+                    self._append_items = True
+                    self.get_logger().info("Failed to pickup part, try again")
+        return True
+                             
     def complete_orders(self):
+        """To complete the kitting orders publisged by the ARIAC manager
+
+        Returns:
+            True if the orders are completed
+        """
         if not self.moveit_enabled:
             self.get_logger().error("Moveit_py is not enabled, unable to complete orders")
             return
-        while len(self._orders) == 0:
-            self.get_logger().info("No orders have been received yet", throttle_duration_sec=5.0)
-
+        # Start the competition and add to planning scene
+        self.start_competition()
         self.add_objects_to_planning_scene()
-
+        sleep(2)
         success = True
-        while True:
-            if (self._competition_state == CompetitionStateMsg.ENDED):
-                success = False
-                break
-
-            if len(self._orders) == 0:
-                if (self._competition_state != CompetitionStateMsg.ORDER_ANNOUNCEMENTS_DONE):
-                    self.get_logger().info("Waiting for orders...")
-                    while len(self._orders) == 0:
-                        sleep(1)
-                else:
-                    self.get_logger().info("Completed all orders")
-                    success = True
-                    break
-
-            self.current_order = copy(self._orders[0])
-            self.current_order : Order
-            del self._orders[0]
-            if self.current_order.order_type == OrderMsg.KITTING:
-                self._complete_kitting_order(self.current_order.order_task)
-                self.submit_order(self.current_order.order_id)
-            else:
-                self.get_logger().info("This tutorial is only able to complete kitting orders")
-        self.end_competition()
+        self._parse_incoming_order = True
+        for order in self._orders:
+            if order.order_type == OrderMsg.KITTING:
+                self.floor_robot_pick_and_place_tray(order.order_task.tray_id, order.order_task.agv_number)
+                self.get_logger().info(f"Placed tray on the AGV:{order.order_task.agv_number}")
+                for part in order.order_task.parts:
+                    # Executed if priority order is recieved
+                    if self._flag:
+                        priority_order_recieved = 0
+                        priority = copy(self._orders[-1])
+                        priority: OrderMsg
+                        del self._orders[-1]
+                        self.get_logger().info("Priority order recieved")
+                        self.floor_robot_pick_and_place_tray(priority.order_task.tray_id, priority.order_task.agv_number)
+                        for ppart in priority.order_task.parts:
+                            self.floor_robot_pick_bin_part(ppart.part)
+                            # If part not found in the bins look for the parts in the conveyor
+                            if not self._found:
+                                self.get_logger().info("Picking part from conveyor")
+                                self.floor_robot_pick_conveyor_part(ppart.part)
+                                self._found = True
+                            self._floor_robot_place_part_on_kit_tray(priority.order_task.agv_number, ppart.quadrant)
+                        self._flag = False
+                        # Executing moving the AGV and submitting the order in a seperate thread
+                        t1 = threading.Thread(target=self.move_agv, args=(priority.order_task.agv_number, priority.order_task.destination,))
+                        t2 = threading.Thread(target=self.kitting_submit_order, args=(priority.order_task.agv_number, priority.order_id,))
+                        # Start the thread
+                        t1.start()
+                        t2.start()
+                        priority_order_recieved +=1
+                    self.get_logger().info(f"Picking part of color: {CompetitionInterface._part_colors[part.part.color]} and type: {CompetitionInterface._part_types[part.part.type]}")
+                    self.floor_robot_pick_bin_part(part.part)
+                    if not self._found:
+                        self.get_logger().info("Picking part from conveyor")
+                        self.floor_robot_pick_conveyor_part(part.part)
+                        self._found = True
+                    self._floor_robot_place_part_on_kit_tray(order.order_task.agv_number, part.quadrant)
+                t3 = threading.Thread(target=self.move_agv, args=(order.order_task.agv_number, order.order_task.destination,))
+                t4 = threading.Thread(target=self.kitting_submit_order, args=(order.order_task.agv_number, order.order_id,))
+                t3.start()
+                t4.start()
+        # Waiting for order announcements to be done
+        while not self.get_competition_state == CompetitionStateMsg.ORDER_ANNOUNCEMENTS_DONE:
+            pass
+        
+        # Ending all the threads
+        if priority_order_recieved > 0:
+            t1.join()
+            t2.join()
+        t3.join()
+        t4.join()
+        
+        # self.end_competition()
         return success
 
-    def _complete_kitting_order(self, kitting_task:KittingTask):
-        self.floor_robot_pick_and_place_tray(kitting_task._tray_id, kitting_task._agv_number)
+    def kitting_submit_order(self, agv_num, order_id):
+        """Function to submit the kitting order
 
-        for kitting_part in kitting_task._parts:
-            self.floor_robot_pick_bin_part(kitting_part._part)
-            self._floor_robot_place_part_on_kit_tray(kitting_task._agv_number, kitting_part.quadrant)
-        
-        self.move_agv(kitting_task._agv_number, kitting_task._destination)
+        Args:
+            agv_num (int): Contains the agv number containing the order
+            order_id (str): Unique identifier for each order
+        """
+        while True:
+            if self._agv_locations[agv_num] == AGVStatusMsg.WAREHOUSE:
+                self.submit_order(order_id)
+                break
 
     def floor_robot_pick_and_place_tray(self, tray_id, agv_number):
+        """Function to commmand the floor robot to pick and place the required tray for the prder
+
+        Args:
+            tray_id (int): Id of the kitting tray
+            agv_number (int): Agv number og the agv to be used in the kitting order
+
+        Returns:
+            _type_: _description_
+        """
         if not self.moveit_enabled:
             self.get_logger().error("Moveit_py is not enabled, pick and place tray")
             return
         tray_pose = Pose
         station = ""
         found_tray = False
-
+        # Look for the kitting stations containing the required trays
         for tray in self._kts1_trays:
             if tray.id == tray_id:
                 station = "kts1"
@@ -1449,6 +1839,7 @@ class CompetitionInterface(Node):
         if self._floor_robot_gripper_state.type != "tray_gripper":
             self._floor_robot_change_gripper(station, "trays")
         
+        # Pose before chnaging the gripper
         gripper_orientation = quaternion_from_euler(0.0,pi,tray_rotation)
         self._move_floor_robot_to_pose(build_pose(tray_pose.position.x, tray_pose.position.y,
                                                   tray_pose.position.z+0.5, gripper_orientation))
@@ -1456,18 +1847,21 @@ class CompetitionInterface(Node):
         waypoints = [build_pose(tray_pose.position.x, tray_pose.position.y,
                                 tray_pose.position.z+0.003,
                                 gripper_orientation)]
+        # Moving down
         self._move_floor_robot_cartesian(waypoints, 0.3, 0.3, False)
         self.set_floor_robot_gripper_state(True)
         self._floor_robot_wait_for_attach(30.0, gripper_orientation)
         waypoints = [build_pose(tray_pose.position.x, tray_pose.position.y,
                                 tray_pose.position.z+0.5,
                                 gripper_orientation)]
+        # Moving up
         self._move_floor_robot_cartesian(waypoints, 0.3, 0.3)
 
         # self.floor_robot_move_joints_dict({"linear_actuator_joint":self._rail_positions[f"agv{agv_number}"],
         #                                "floor_shoulder_pan_joint":0})
 
         agv_tray_pose = self._frame_world_pose(f"agv{agv_number}_tray")
+        self._agv_tray_pose = agv_tray_pose
         agv_rotation = rpy_from_quaternion(agv_tray_pose.orientation)[2]
 
         agv_quaternion = quaternion_from_euler(0.0,pi,agv_rotation)
@@ -1477,17 +1871,27 @@ class CompetitionInterface(Node):
         
         waypoints = [build_pose(agv_tray_pose.position.x, agv_tray_pose.position.y,
                                 agv_tray_pose.position.z+0.01,agv_quaternion)]
-        
+        # Placing the tray
         self._move_floor_robot_cartesian(waypoints, 0.3, 0.3)
         self.set_floor_robot_gripper_state(False)
         self.lock_agv_tray(agv_number)
 
         waypoints = [build_pose(agv_tray_pose.position.x, agv_tray_pose.position.y,
                                 agv_tray_pose.position.z+0.3,quaternion_from_euler(0.0,pi,0.0))]
+        # Coming back to a pre defined posiition
         self._move_floor_robot_cartesian(waypoints,0.3,0.3)
+        # return True
 
     
     def _frame_world_pose(self,frame_id : str):
+        """Generates the pose of the required frame in the world frame
+
+        Args:
+            frame_id (str): Frame id of the required frame
+
+        Returns:
+            Returns pose of the required frame with respect to the world frame 
+        """
         self.get_logger().info(f"Getting transform for frame: {frame_id}")
         # try:
         t = self.tf_buffer.lookup_transform("world",frame_id,rclpy.time.Time())
@@ -1504,7 +1908,15 @@ class CompetitionInterface(Node):
         return pose
         
     def _floor_robot_place_part_on_kit_tray(self, agv_num : int, quadrant : int):
-        
+        """To place the picked up part on the kitting tray by the floor robot
+
+        Args:
+            agv_num (int): Agv number used in the kitting order
+            quadrant (int): Quadrant in the kit tray to place the part
+
+        Returns:
+            Returns true if the operation is complete
+        """
         if not self._floor_robot_gripper_state.attached:
             self.get_logger().error("No part attached")
             return False
