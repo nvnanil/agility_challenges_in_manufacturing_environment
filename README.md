@@ -15,6 +15,7 @@ RViz 2
 ```
 ## Running the package
 1. *Clone the ARIAC 2024 simulation environment into your ROS workspace*
+https://pages.nist.gov/ARIAC_docs/en/latest/getting_started/installation.html#configuring-the-ariac-environment
 ```
 git clone https://github.com/usnistgov/ARIAC.git -b ariac2024
 ```
