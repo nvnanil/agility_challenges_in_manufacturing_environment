@@ -26,7 +26,7 @@ git clone https://github.com/nvnanil/agility_challenges_in_manufacturing_environ
 ```
 3. *To start the simulation*
 ```
-ros2 launch ariac_gazebo ariac.launch.py dev_mode:=true
+ros2 launch ariac_gazebo ariac.launch.py dev_mode:=true competitor_pkg:=naveen_package
 ```
 4. *To launch the package*
 ```
