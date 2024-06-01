@@ -4,6 +4,8 @@
 1. Pick and place from moving conveyor
 2. High priority orders
 ```
+Demonstration: https://youtu.be/vY-SqHADYRU
+
 ![](conveyor_pick_up.png)
 ## Software Requirements
 ```
@@ -32,3 +34,4 @@ ros2 launch ariac_gazebo ariac.launch.py dev_mode:=true competitor_pkg:=naveen_p
 ```
 ros2 launch naveen_package perform_kitting.launch.py
 ```
+
